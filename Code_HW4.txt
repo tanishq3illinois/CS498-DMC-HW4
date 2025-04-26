@@ -1,1 +1,123 @@
-blah
+APP:
+
+
+from flask import Flask, request, jsonify
+import json
+import re
+
+app = Flask(__name__)
+
+data = []
+with open('processed_data/search_data.json', 'r') as f:
+    for line in f:
+        if line.strip():
+            data.append(json.loads(line))
+    
+
+@app.route('/results', methods=['POST'])
+def get_results():
+    request_data = request.get_json()
+    search_term = request_data['term']
+    normalized_term = f"\u2018{search_term.strip('')}\u2019"
+    url_clicks = {}
+    for record in data:
+        if record['term'] == normalized_term:
+            url = record['url']
+            clicks = record['clicks']
+            url_clicks[url] = url_clicks.get(url, 0) + clicks
+    sorted_urls = sorted(url_clicks.items(), key=lambda x: (
+        -x[1],
+        0 if x[0].endswith('.org') else 
+        1 if x[0].endswith('.edu') else 
+        2 if x[0].endswith('.com') else 3
+    ))
+    return app.response_class(
+        response=json.dumps({"results": dict(sorted_urls)}),
+        mimetype='application/json'
+    )
+
+@app.route('/trends', methods=['POST'])
+def get_trends():
+    request_data = request.get_json()
+    search_term = request_data['term']
+    normalized_term = f"\u2018{search_term.strip('')}\u2019"
+    total_clicks = sum(r['clicks'] for r in data if r['term'] == normalized_term)
+    return jsonify({"clicks": total_clicks})
+
+@app.route('/popularity', methods=['POST'])
+def get_popularity():
+    request_data = request.get_json()
+    url = request_data['url']
+    total_clicks = sum(r['clicks'] for r in data if r['url'] == url)
+    return jsonify({"clicks": total_clicks})
+
+@app.route('/getBestTerms', methods=['POST'])
+def get_best_terms():
+    request_data = request.get_json()
+    website_url = request_data['website']
+    url_records = [r for r in data if r['url'] == website_url]
+    total_clicks = sum(r['clicks'] for r in url_records)
+    if total_clicks == 0:
+        return jsonify({"best_terms": []})
+    term_clicks = {}
+    for record in url_records:
+        clean_term = re.sub(r"['\u2018\u2019]", "", record['term'])
+        term_clicks[clean_term] = term_clicks.get(clean_term, 0) + record['clicks']
+    best_terms = [term for term, clicks in term_clicks.items() 
+                  if (clicks / total_clicks) > 0.05]
+    
+    return jsonify({"best_terms": best_terms})
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', debug=True)
+
+
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+PREPROCESSING:
+
+import os
+import glob
+import shutil
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+
+output_dir = "processed_data"
+os.makedirs(output_dir, exist_ok=True)
+
+spark = SparkSession.builder.appName("SearchLog").master("local[*]").getOrCreate()
+
+def parse_log_line(line):
+    if not line or 'searchTerm: ' not in line:
+        return []
+    
+    line = line.replace('searchTerm: ', '')
+    parts = line.split(',', 1)
+    if len(parts) != 2:
+        return []
+    
+    results = []
+    term = parts[0].strip()
+    for pair in parts[1].strip().split('~'):
+        if ':' in pair:
+            url, clicks_str = pair.split(':')
+            results.append((term, url.strip(), int(clicks_str)))
+    return results
+
+df = spark.createDataFrame(
+    spark.sparkContext.textFile("searchLog.csv").flatMap(parse_log_line),
+    StructType([
+        StructField("term", StringType(), False),
+        StructField("url", StringType(), False),
+        StructField("clicks", IntegerType(), False)
+    ])
+)
+
+df.write.mode("overwrite").json(output_dir)
+df.coalesce(1).write.mode("overwrite").json(f"{output_dir}/single")
+
+os.rename(glob.glob(f"{output_dir}/single/part-*.json")[0], f"{output_dir}/search_data.json")
+shutil.rmtree(f"{output_dir}/single")
+spark.stop()
